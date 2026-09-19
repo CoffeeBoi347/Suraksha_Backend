@@ -30,7 +30,7 @@ async def main_suraksha(websocket: WebSocket):
 
     try:
         while True:
-            jpeg_bytes = websocket.receive_bytes()
+            jpeg_bytes = await websocket.receive_bytes()
             np_arr = np.frombuffer(jpeg_bytes, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
@@ -40,13 +40,13 @@ async def main_suraksha(websocket: WebSocket):
             results = model.track(
                 source=frame,
                 persist=True,
-                tracker="bytetracker.yaml",
+                tracker="bytetrack.yaml",
                 classes=[0],
                 verbose=False
             )
 
             targets: list[ThreatBox] = []
-            if results and results[0].boxes is not None and results[0].boxes.id is not None:
+            if results and len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes.xywhn.cpu().numpy()
                 track_ids = results[0].boxes.id.cpu().numpy().astype(int)
             else:
