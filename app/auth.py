@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
-from supabase import Client, create_client
+from supabase import Client, create_client, User
 
 load_dotenv()
 
@@ -64,6 +64,18 @@ async def sign_up(payload: SignUpRequest):
             }
         )
 
+        user = response.user
+        if not user:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User creation failed")
+
+        profile_data = {
+            "id": user.id,
+            "full_name": payload.full_name,
+            "phone_number": payload.phone_number
+        }
+
+        supabase.table("profiles").upsert(profile_data).execute()
+
         return{
             "message": "User registered successfully",
             "user_id": response.user.id if response.user else None,
@@ -80,11 +92,16 @@ async def login(payload: LoginRequest):
             "password": payload.password
         })
 
+        profile = supabase.table("profiles").select("full_name, phone_number").eq("id", response.user.id).maybe_single().execute()
+        profile_data = profile.data if profile and profile.data else {}
+
         return{
             "access_token": response.session.access_token,
             "refresh_token": response.session.refresh_token,
             "token_type": "bearer",
-            "user_id": response.user.id
+            "user_id": response.user.id,
+            "full_name": profile_data.get("full_name"),
+            "phone_number": profile_data.get("phone_number")
         }
 
     except Exception as e:
@@ -108,8 +125,8 @@ async def forgot_password(payload: ForgotPasswordRequest):
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordRequest):
     try:
-        supabase.auth.api.update_user_by_jwt(
-            payload.access_token, {"password": payload.new_password}
+        supabase.auth.update_user(
+            {"password": payload.new_password}
         )
         return {"message": "Password updated successfully."}
     except Exception as e:
@@ -117,6 +134,22 @@ async def reset_password(payload: ResetPasswordRequest):
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         )
 
-router.get("/me")
-async def read_current_user(current_user=Depends(get_current_user)):
-    return {"user_id": current_user.id, "email": current_user.email}
+@router.get("/me")
+async def read_current_user(current_user: User = Depends(get_current_user)):
+    profile = (
+        supabase.table("profiles")
+        .select("full_name, phone_number, created_at")
+        .eq("id", current_user.id)
+        .maybe_single()
+        .execute()
+    )
+
+    profile_data = profile.data if profile and profile.data else {}
+
+    return {
+        "user_id": current_user.id,
+        "email": current_user.email,
+        "full_name": profile_data.get("full_name"),
+        "phone_number": profile_data.get("phone_number"),
+        "created_at": profile_data.get("created_at")
+    }
