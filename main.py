@@ -4,7 +4,7 @@ from app.auth import router as auth_router
 from app.payload import app as payload_app, main_suraksha
 from app.sos import router as sos_router
 
-app = FastAPI(itle="Suraksha Core Engine")
+app = FastAPI(title="Suraksha Core Engine")
 
 app.include_router(auth_router)
 app.add_api_websocket_route("/prod/main", main_suraksha)
