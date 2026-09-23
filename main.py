@@ -1,18 +1,24 @@
-import uvicorn
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
-from app.auth import router as auth_router
-from app.payload import app as payload_app, main_suraksha
-from app.sos import router as sos_router
 
-app = FastAPI(title="Suraksha Core Engine")
+from app import auth, sos, payload
 
-app.include_router(auth_router)
-app.add_api_websocket_route("/prod/main", main_suraksha)
-app.include_router(sos_router)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-@app.get("/")
-async def root():
-    return {"status": "online", "system": "Suraksha Backend API"}
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await sos.resume_pending_dispatches()  
+
+
+app = FastAPI(title="Suraksha Core Engine", lifespan=lifespan)
+app.include_router(auth.router)
+app.include_router(sos.router)
+app.include_router(payload.router)
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
