@@ -17,22 +17,21 @@ from app.db import User, db, normalize_in_phone, supabase_admin
 log = logging.getLogger("suraksha.sos")
 router = APIRouter(prefix="/sos", tags=["SOS Emergency Engine"])
 
-# ---------- config ----------
 FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
 FAST2SMS_URL = os.getenv("FAST2SMS_URL", "https://www.fast2sms.com/dev/bulkV2")
 # "dlt" = DLT-registered template (required for reliable delivery with links in India)
 # "q"   = quick route (fine for testing; links may be blocked by TRAI URL whitelisting)
 FAST2SMS_ROUTE = os.getenv("FAST2SMS_ROUTE", "q")
 FAST2SMS_SENDER_ID = os.getenv("FAST2SMS_SENDER_ID", "")
-FAST2SMS_DLT_TEMPLATE_ID = os.getenv("FAST2SMS_DLT_TEMPLATE_ID", "")  # vars: name|lat,lng|track_url
+FAST2SMS_DLT_TEMPLATE_ID = os.getenv("FAST2SMS_DLT_TEMPLATE_ID", "")  
 
 EXOTEL_SID = os.getenv("EXOTEL_ACCOUNT_SID")
 EXOTEL_CALLER_ID = os.getenv("EXOTEL_CALLER_ID")
 EXOTEL_APP_ID = os.getenv("EXOTEL_APP_ID")
 EXOTEL_API_KEY = os.getenv("EXOTEL_API_KEY")
 EXOTEL_API_TOKEN = os.getenv("EXOTEL_API_TOKEN")
-EXOTEL_SUBDOMAIN = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")  # api.in.exotel.com for Mumbai cluster
-EXOTEL_WEBHOOK_SECRET = os.getenv("EXOTEL_WEBHOOK_SECRET", "")      # append ?key=... to the Passthru URL
+EXOTEL_SUBDOMAIN = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")  
+EXOTEL_WEBHOOK_SECRET = os.getenv("EXOTEL_WEBHOOK_SECRET", "")     
 
 # Tracking page on YOUR domain — whitelist this domain with your DLT provider.
 TRACK_BASE_URL = os.getenv("TRACK_BASE_URL", "https://suraksha-app.com/t")
@@ -40,8 +39,8 @@ TRACK_BASE_URL = os.getenv("TRACK_BASE_URL", "https://suraksha-app.com/t")
 NATIONAL_EMERGENCY = "112"
 MAX_CONTACTS = 5
 DEDUPE_WINDOW = timedelta(minutes=30)
-RATE_LIMIT_N, RATE_LIMIT_WINDOW = 5, 600  # 5 triggers / 10 min / user
-RETRY_DELAYS = (0, 2, 5, 12)              # 4 attempts
+RATE_LIMIT_N, RATE_LIMIT_WINDOW = 5, 600 
+RETRY_DELAYS = (0, 2, 5, 12)             
 
 _trigger_log: dict[str, deque] = defaultdict(deque)
 
@@ -188,9 +187,7 @@ async def _with_retry(incident_id: str, channel: str, target: str, fn) -> bool:
     return False
 
 
-# ---------- dispatch worker ----------
 async def dispatch_incident(incident_id: str):
-    """Idempotent: only runs channels still PENDING/FAILED. Safe to re-run after a crash."""
     try:
         res = await db(lambda: supabase_admin.table("sos_incidents").select("*")
                        .eq("id", incident_id).single().execute())
@@ -229,7 +226,6 @@ async def dispatch_incident(incident_id: str):
         else:
             await _update_incident(incident_id, {"contacts_status": "NO_CONTACTS"})
 
-    # official desk
     desk_phone = inc.get("dispatched_phone") or NATIONAL_EMERGENCY
     if inc["desk_status"] in ("PENDING", "FAILED"):
         if _is_short_code(desk_phone):
@@ -256,7 +252,6 @@ async def dispatch_incident(incident_id: str):
 
 
 async def resume_pending_dispatches():
-    """Call on startup: re-dispatch anything a crash/redeploy left half-done."""
     cutoff = (_now() - DEDUPE_WINDOW).isoformat()
     try:
         res = await db(lambda: supabase_admin.table("sos_incidents").select("id")
@@ -305,7 +300,6 @@ def _public_incident(inc: dict) -> dict:
         "contacts_status": inc.get("contacts_status"),
         "desk_status": inc.get("desk_status"),
         "official_desk": inc.get("dispatched_to_desk"),
-        # Client MUST open the dialer with this (tel:112). Backend can't reach emergency short codes.
         "client_should_dial": NATIONAL_EMERGENCY,
     }
 
@@ -318,7 +312,6 @@ async def _get_owned_incident(incident_id: str, user_id: str) -> dict:
     return r.data
 
 
-# ---------- routes ----------
 _bg_tasks: set[asyncio.Task] = set()
 
 
@@ -339,10 +332,9 @@ async def fire_sos(user: User, *, latitude: float | None, longitude: float | Non
                    accuracy_m: float = 0.0, speed_mps: float = 0.0, battery_percentage: int | None = None,
                    state_code: str = "NATIONAL", district: str = "All", snapshot_url: str | None = None,
                    threat_level: str = "CRITICAL", source: str = "MANUAL") -> dict:
-    """Single entry point for every SOS (button, voice, auto-trigger from the HUD)."""
+
     uid = user.id
 
-    # 1. dedupe: repeated taps / auto + manual overlap → same incident
     since = (_now() - DEDUPE_WINDOW).isoformat()
     try:
         existing = await db(lambda: supabase_admin.table("sos_incidents").select("*")
@@ -365,7 +357,6 @@ async def fire_sos(user: User, *, latitude: float | None, longitude: float | Non
     if _rate_limited(uid):
         raise SOSFireError(status.HTTP_429_TOO_MANY_REQUESTS, "Too many SOS triggers. Dial 112 directly.")
 
-    # 2. persist first
     meta = user.user_metadata or {}
     desk = await _find_desk(state_code.upper(), district)
     incident = {
@@ -398,7 +389,6 @@ async def fire_sos(user: User, *, latitude: float | None, longitude: float | Non
     if latitude is not None and longitude is not None:
         await _record_location(inc["id"], latitude, longitude, accuracy_m, speed_mps, battery_percentage)
 
-    # 3. dispatch
     spawn(dispatch_incident(inc["id"]))
     log.warning("SOS FIRED user=%s incident=%s source=%s", uid, inc["id"], source)
     return {**_public_incident(inc), "deduplicated": False}
@@ -429,7 +419,7 @@ async def _record_location(incident_id: str, lat: float, lng: float, acc: float,
 @router.post("/{incident_id}/location")
 async def update_location(incident_id: str, payload: LocationUpdate,
                           current_user: User = Depends(get_current_user)):
-    """Phone calls this every 10–15 s while an SOS is active."""
+
     inc = await _get_owned_incident(incident_id, current_user.id)
     if inc["status"] != "ACTIVE":
         raise HTTPException(status.HTTP_409_CONFLICT, "Incident is not active")
@@ -462,7 +452,6 @@ async def cancel_sos(incident_id: str, payload: CancelRequest, background_tasks:
 
 @router.get("/track/{share_token}")
 async def public_track(share_token: str):
-    """Backs the tracking page at TRACK_BASE_URL/<token>. Token is unguessable; no auth."""
     r = await db(lambda: supabase_admin.table("sos_incidents")
                  .select("id, user_name, status, latitude, longitude, accuracy_m, battery_percentage, last_seen_at, created_at")
                  .eq("share_token", share_token).maybe_single().execute())
@@ -481,11 +470,6 @@ async def public_track(share_token: str):
 
 @router.get("/tts-message", response_class=PlainTextResponse, include_in_schema=False)
 async def exotel_tts(CustomField: str = "", key: str = Query("")):
-    """
-    Exotel Greeting applet → Dynamic URL. Set it to:
-      https://<your-api>/sos/tts-message?key=<EXOTEL_WEBHOOK_SECRET>
-    Exotel appends CallSid, CustomField, etc. Must return PLAIN TEXT.
-    """
     if not EXOTEL_WEBHOOK_SECRET or not secrets.compare_digest(key, EXOTEL_WEBHOOK_SECRET):
         return PlainTextResponse("Unauthorized", status_code=401)
 

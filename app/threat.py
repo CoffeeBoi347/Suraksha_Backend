@@ -3,7 +3,6 @@ from collections import deque
 
 import numpy as np
 
-# COCO keypoints
 L_SH, R_SH, L_EL, R_EL, L_WR, R_WR, L_HIP, R_HIP = 5, 6, 7, 8, 9, 10, 11, 12
 
 HISTORY_S = 6.0
