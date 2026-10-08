@@ -1,16 +1,25 @@
-import os
-from supabase import Client, create_client  
-from dotenv import load_dotenv
+import logging
+from contextlib import asynccontextmanager
 
-load_dotenv()
+from fastapi import FastAPI
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+from app import auth, sos, vision
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-try:
-    response = supabase.table("profiles").select("*").limit(1).execute()
-    print("Successfully connected to Supabase")
-except Exception as e:
-    print(f"Connection failed. Reason: {str(e)}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await sos.resume_pending_dispatches()  # recover SOS dispatches interrupted by a crash/redeploy
+    yield
+
+
+app = FastAPI(title="Suraksha Core Engine", lifespan=lifespan)
+app.include_router(auth.router)
+app.include_router(sos.router)
+app.include_router(vision.router)
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}

@@ -3,46 +3,37 @@ import logging
 import os
 import secrets
 import time
-from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.auth import get_current_user
 from app.db import User, db, normalize_in_phone, supabase_admin
+from app.whatsapp import WA_SAFE_CONTENT_SID, WA_SOS_CONTENT_SID, wa_ready, wa_send
 
 log = logging.getLogger("suraksha.sos")
 router = APIRouter(prefix="/sos", tags=["SOS Emergency Engine"])
 
-FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
-FAST2SMS_URL = os.getenv("FAST2SMS_URL", "https://www.fast2sms.com/dev/bulkV2")
-# "dlt" = DLT-registered template (required for reliable delivery with links in India)
-# "q"   = quick route (fine for testing; links may be blocked by TRAI URL whitelisting)
-FAST2SMS_ROUTE = os.getenv("FAST2SMS_ROUTE", "q")
-FAST2SMS_SENDER_ID = os.getenv("FAST2SMS_SENDER_ID", "")
-FAST2SMS_DLT_TEMPLATE_ID = os.getenv("FAST2SMS_DLT_TEMPLATE_ID", "")  
-
-EXOTEL_SID = os.getenv("EXOTEL_ACCOUNT_SID")
-EXOTEL_CALLER_ID = os.getenv("EXOTEL_CALLER_ID")
-EXOTEL_APP_ID = os.getenv("EXOTEL_APP_ID")
-EXOTEL_API_KEY = os.getenv("EXOTEL_API_KEY")
-EXOTEL_API_TOKEN = os.getenv("EXOTEL_API_TOKEN")
-EXOTEL_SUBDOMAIN = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")  
-EXOTEL_WEBHOOK_SECRET = os.getenv("EXOTEL_WEBHOOK_SECRET", "")     
-
-# Tracking page on YOUR domain — whitelist this domain with your DLT provider.
+# Tracking page on YOUR domain.
 TRACK_BASE_URL = os.getenv("TRACK_BASE_URL", "https://suraksha-app.com/t")
 
 NATIONAL_EMERGENCY = "112"
-MAX_CONTACTS = 5
+MAX_CONTACTS = 3
 DEDUPE_WINDOW = timedelta(minutes=30)
-RATE_LIMIT_N, RATE_LIMIT_WINDOW = 5, 600 
-RETRY_DELAYS = (0, 2, 5, 12)             
 
-_trigger_log: dict[str, deque] = defaultdict(deque)
+# ---- rate limits (counted from sos_incidents: survive restarts and multiple workers) ----
+RATE_LIMIT_ENABLED = os.getenv("SOS_RATE_LIMIT", "1") == "1"   # SOS_RATE_LIMIT=0 while testing
+RATE_POLICY = {   # source: (max new incidents per 10 min, per 24 h, min seconds between new incidents)
+    "MANUAL":   (3, 10, 10),
+    "AUTO_HUD": (2, 6, 60),
+}
+RETRY_DELAYS = (0, 2, 5, 12)
+
+_loc_last: dict[str, float] = {}   # incident_id -> last accepted location update (throttle)
+
+if not wa_ready(WA_SOS_CONTENT_SID):
+    log.error("WhatsApp SOS not configured: need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, WA_SOS_CONTENT_SID")
 
 
 # ---------- models ----------
@@ -86,23 +77,34 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _rate_limited(user_id: str) -> bool:
-    q, t = _trigger_log[user_id], time.time()
-    while q and t - q[0] > RATE_LIMIT_WINDOW:
-        q.popleft()
-    if len(q) >= RATE_LIMIT_N:
-        return True
-    q.append(t)
-    return False
+async def _count_incidents(uid: str, source: str, seconds: int) -> int:
+    since = (_now() - timedelta(seconds=seconds)).isoformat()
+    r = await db(lambda: supabase_admin.table("sos_incidents").select("id", count="exact")
+                 .eq("user_id", uid).eq("trigger_source", source).gte("created_at", since).limit(1).execute())
+    return r.count or 0
+
+
+async def _rate_block(uid: str, source: str) -> tuple[str, int] | None:
+    """(reason, retry_after_s) if a NEW incident must be refused, else None. Fails open on our own errors."""
+    per10, per_day, gap = RATE_POLICY.get(source, RATE_POLICY["AUTO_HUD"])
+    try:
+        n_gap, n_10, n_day = await asyncio.gather(
+            _count_incidents(uid, source, gap), _count_incidents(uid, source, 600),
+            _count_incidents(uid, source, 86400))
+    except Exception as e:
+        log.error("rate check failed, allowing: %s", e)
+        return None
+    if n_gap:
+        return "Too many SOS triggers in a row.", gap
+    if n_10 >= per10:
+        return "Too many SOS triggers.", 600
+    if n_day >= per_day:
+        return "Daily SOS limit reached.", 3600
+    return None
 
 
 def _is_short_code(num: str) -> bool:
     return len("".join(c for c in num if c.isdigit())) < 8
-
-
-def _ten_digit(num: str) -> str:
-    d = "".join(c for c in num if c.isdigit())
-    return d[-10:]
 
 
 def _track_url(share_token: str) -> str:
@@ -126,51 +128,6 @@ async def _log_dispatch(incident_id: str, channel: str, target: str, ok: bool, a
         log.error("dispatch log failed: %s", e)
 
 
-# ---------- providers ----------
-async def _fast2sms_send(numbers: list[str], text: str, dlt_vars: str) -> tuple[bool, str]:
-    if not FAST2SMS_API_KEY:
-        return False, "FAST2SMS_API_KEY missing"
-    nums = ",".join(_ten_digit(n) for n in numbers)
-    if FAST2SMS_ROUTE == "dlt" and FAST2SMS_DLT_TEMPLATE_ID:
-        data = {"route": "dlt", "sender_id": FAST2SMS_SENDER_ID, "message": FAST2SMS_DLT_TEMPLATE_ID,
-                "variables_values": dlt_vars, "numbers": nums, "flash": "0"}
-    else:
-        data = {"route": "q", "message": text, "numbers": nums, "flash": "0"}
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(FAST2SMS_URL, headers={"authorization": FAST2SMS_API_KEY}, data=data)
-    try:
-        body = r.json()
-    except ValueError:
-        return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    if body.get("return"):
-        return True, f"request_id={body.get('request_id')}"
-    return False, str(body.get("message"))
-
-
-async def _exotel_call(target_phone: str, incident_id: str) -> tuple[bool, str]:
-    if not all([EXOTEL_SID, EXOTEL_API_KEY, EXOTEL_API_TOKEN, EXOTEL_CALLER_ID, EXOTEL_APP_ID]):
-        return False, "Exotel credentials missing"
-    url = f"https://{EXOTEL_SUBDOMAIN}/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
-    data = {
-        "From": "0" + _ten_digit(target_phone),
-        "CallerId": EXOTEL_CALLER_ID,
-        "Url": f"http://my.exotel.com/{EXOTEL_SID}/exoml/start_voice/{EXOTEL_APP_ID}",
-        "CallType": "trans",
-        "TimeLimit": "300",
-        "CustomField": incident_id,  # TTS endpoint looks the incident up by id — no PII in transit
-    }
-    async with httpx.AsyncClient(timeout=10.0, auth=(EXOTEL_API_KEY, EXOTEL_API_TOKEN)) as client:
-        r = await client.post(url, data=data)
-    if r.status_code == 200:
-        try:
-            sid = r.json().get("Call", {}).get("Sid")
-        except ValueError:
-            sid = None
-        return True, f"call_sid={sid}"
-    return False, f"HTTP {r.status_code}: {r.text[:200]}"
-
-
 async def _with_retry(incident_id: str, channel: str, target: str, fn) -> bool:
     for attempt, delay in enumerate(RETRY_DELAYS, start=1):
         if delay:
@@ -187,6 +144,14 @@ async def _with_retry(incident_id: str, channel: str, target: str, fn) -> bool:
     return False
 
 
+async def _wa_fanout(incident_id: str, channel: str, numbers: list[str], content_sid: str, wa_vars: dict) -> bool:
+    """One retry loop per number, all in parallel. True if at least one was accepted."""
+    res = await asyncio.gather(*(
+        _with_retry(incident_id, channel, n, lambda n=n: wa_send(n, content_sid, wa_vars))
+        for n in numbers), return_exceptions=True)
+    return any(r is True for r in res)
+
+
 async def dispatch_incident(incident_id: str):
     try:
         res = await db(lambda: supabase_admin.table("sos_incidents").select("*")
@@ -200,52 +165,60 @@ async def dispatch_incident(incident_id: str):
 
     name = inc.get("user_name") or "A Suraksha user"
     lat, lng = inc["latitude"], inc["longitude"]
-    link = _track_url(inc["share_token"])
-    loc = f"{lat:.5f},{lng:.5f}" if lat is not None and lng is not None else "unknown (updating)"
-    auto = " (auto-detected threat)" if inc.get("trigger_source") == "AUTO_HUD" else ""
-    text = (f"SURAKSHA SOS{auto}: {name} needs help NOW. "
-            f"Location {loc}. Live: {link} "
-            f"Call them or dial 112.")
-    dlt_vars = f"{name}|{loc}|{link}"
+    log.warning("[%s] dispatch coords lat=%s lng=%s", incident_id, lat, lng)
+    if lat is not None and lng is not None:
+        loc = f"{lat:.5f}, {lng:.5f}"
+        maps = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lng:.6f}"
+    else:
+        loc, maps = "unknown (updating)", _track_url(inc["share_token"])
+    wa_vars = {"1": name, "2": loc, "3": maps}
+    configured = wa_ready(WA_SOS_CONTENT_SID)
 
     jobs = []
 
     # contacts
     if inc["contacts_status"] in ("PENDING", "FAILED"):
-        c = await db(lambda: supabase_admin.table("emergency_contacts").select("phone_number")
-                     .eq("user_id", inc["user_id"]).execute())
-        numbers = [x["phone_number"] for x in (c.data or [])]
-        if numbers:
+        numbers: list[str] = []
+        contacts_lookup_ok = True
+        try:
+            c = await db(lambda: supabase_admin.table("emergency_contacts").select("phone_number")
+                         .eq("user_id", inc["user_id"]).execute())
+            numbers = [x["phone_number"] for x in (c.data or [])]
+        except Exception as e:
+            contacts_lookup_ok = False
+            log.error("[%s] contacts lookup failed: %s", incident_id, e)
+
+        if not contacts_lookup_ok:
+            await _update_incident(incident_id, {"contacts_status": "FAILED"})
+        elif not numbers:
+            await _update_incident(incident_id, {"contacts_status": "NO_CONTACTS"})
+        elif not configured:
+            log.error("[%s] WhatsApp SOS not configured, contacts not notified", incident_id)
+            await _update_incident(incident_id, {"contacts_status": "FAILED"})
+        else:
             await _update_incident(incident_id, {"contacts_status": "SENDING"})
 
             async def contacts_job():
-                ok = await _with_retry(incident_id, "SMS_CONTACTS", ",".join(numbers),
-                                       lambda: _fast2sms_send(numbers, text, dlt_vars))
+                ok = await _wa_fanout(incident_id, "WA_CONTACTS", numbers, WA_SOS_CONTENT_SID, wa_vars)
                 await _update_incident(incident_id, {"contacts_status": "SENT" if ok else "FAILED"})
             jobs.append(contacts_job())
-        else:
-            await _update_incident(incident_id, {"contacts_status": "NO_CONTACTS"})
 
+    # official desk (must be a WhatsApp-enabled mobile; short codes like 112 are dialled by the client)
     desk_phone = inc.get("dispatched_phone") or NATIONAL_EMERGENCY
     if inc["desk_status"] in ("PENDING", "FAILED"):
         if _is_short_code(desk_phone):
             await _update_incident(incident_id, {"desk_status": "CLIENT_DIALS"})
-        elif inc.get("desk_channel") == "SMS":
-            await _update_incident(incident_id, {"desk_status": "SENDING"})
-
-            async def desk_sms_job():
-                ok = await _with_retry(incident_id, "SMS_DESK", desk_phone,
-                                       lambda: _fast2sms_send([desk_phone], "[DISPATCH] " + text, dlt_vars))
-                await _update_incident(incident_id, {"desk_status": "SENT" if ok else "FAILED"})
-            jobs.append(desk_sms_job())
+        elif not configured:
+            log.error("[%s] WhatsApp SOS not configured, desk not notified", incident_id)
+            await _update_incident(incident_id, {"desk_status": "FAILED"})
         else:
             await _update_incident(incident_id, {"desk_status": "SENDING"})
 
-            async def desk_call_job():
-                ok = await _with_retry(incident_id, "IVR_DESK", desk_phone,
-                                       lambda: _exotel_call(desk_phone, incident_id))
+            async def desk_job():
+                ok = await _with_retry(incident_id, "WA_DESK", desk_phone,
+                                       lambda: wa_send(desk_phone, WA_SOS_CONTENT_SID, wa_vars))
                 await _update_incident(incident_id, {"desk_status": "SENT" if ok else "FAILED"})
-            jobs.append(desk_call_job())
+            jobs.append(desk_job())
 
     if jobs:
         await asyncio.gather(*jobs, return_exceptions=True)
@@ -261,20 +234,25 @@ async def resume_pending_dispatches():
     except Exception as e:
         log.error("resume scan failed: %s", e)
         return
+
     for row in res.data or []:
+        rid = row["id"]
         # SENDING at boot means the worker died mid-flight → retry
-        await db(lambda rid=row["id"]: supabase_admin.table("sos_incidents")
-                 .update({"contacts_status": "FAILED"}).eq("id", rid).eq("contacts_status", "SENDING").execute())
-        await db(lambda rid=row["id"]: supabase_admin.table("sos_incidents")
-                 .update({"desk_status": "FAILED"}).eq("id", rid).eq("desk_status", "SENDING").execute())
-        asyncio.create_task(dispatch_incident(row["id"]))
+        try:
+            await db(lambda rid=rid: supabase_admin.table("sos_incidents")
+                     .update({"contacts_status": "FAILED"}).eq("id", rid).eq("contacts_status", "SENDING").execute())
+            await db(lambda rid=rid: supabase_admin.table("sos_incidents")
+                     .update({"desk_status": "FAILED"}).eq("id", rid).eq("desk_status", "SENDING").execute())
+        except Exception as e:
+            log.error("resume reset failed for %s: %s", rid, e)
+        spawn(dispatch_incident(rid))
+
     if res.data:
         log.warning("resumed %d pending SOS dispatches", len(res.data))
 
 
 async def _find_desk(state_code: str, district: str) -> dict:
-    fallback = {"organization_name": "Pan-India Emergency Response (112)",
-                "phone_number": NATIONAL_EMERGENCY, "can_receive_sms": False}
+    fallback = {"organization_name": "Pan-India Emergency Response (112)", "phone_number": NATIONAL_EMERGENCY}
     t = supabase_admin.table("safety_desks")
     try:
         for q in (
@@ -305,8 +283,12 @@ def _public_incident(inc: dict) -> dict:
 
 
 async def _get_owned_incident(incident_id: str, user_id: str) -> dict:
-    r = await db(lambda: supabase_admin.table("sos_incidents").select("*")
-                 .eq("id", incident_id).eq("user_id", user_id).maybe_single().execute())
+    try:
+        r = await db(lambda: supabase_admin.table("sos_incidents").select("*")
+                     .eq("id", incident_id).eq("user_id", user_id).maybe_single().execute())
+    except Exception as e:
+        log.error("incident lookup failed (%s): %s", incident_id, e)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
     if not r or not r.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
     return r.data
@@ -354,8 +336,13 @@ async def fire_sos(user: User, *, latitude: float | None, longitude: float | Non
             spawn(dispatch_incident(inc["id"]))
         return {**_public_incident(inc), "deduplicated": True}
 
-    if _rate_limited(uid):
-        raise SOSFireError(status.HTTP_429_TOO_MANY_REQUESTS, "Too many SOS triggers. Dial 112 directly.")
+    blocked = await _rate_block(uid, source) if RATE_LIMIT_ENABLED else None
+    if blocked:
+        reason, retry = blocked
+        log.warning("SOS rate-limited user=%s source=%s: %s", uid, source, reason)
+        raise SOSFireError(status.HTTP_429_TOO_MANY_REQUESTS,
+                           {"message": f"{reason} Dial 112 directly.", "client_should_dial": NATIONAL_EMERGENCY,
+                            "retry_after_s": retry})
 
     meta = user.user_metadata or {}
     desk = await _find_desk(state_code.upper(), district)
@@ -373,7 +360,7 @@ async def fire_sos(user: User, *, latitude: float | None, longitude: float | Non
         "trigger_source": source,
         "dispatched_to_desk": desk.get("organization_name"),
         "dispatched_phone": desk.get("phone_number"),
-        "desk_channel": "SMS" if desk.get("can_receive_sms") else "IVR",
+        "desk_channel": "WHATSAPP",
         "contacts_status": "PENDING",
         "desk_status": "PENDING",
         "status": "ACTIVE",
@@ -416,6 +403,83 @@ async def _record_location(incident_id: str, lat: float, lng: float, acc: float,
         log.error("location record failed for %s: %s", incident_id, e)
 
 
+# ---------- contacts (declared before /{incident_id} routes) ----------
+@router.post("/contacts", status_code=status.HTTP_201_CREATED)
+async def add_contact(payload: ContactRequest, current_user: User = Depends(get_current_user)):
+    try:
+        existing = await db(lambda: supabase_admin.table("emergency_contacts").select("id, phone_number")
+                            .eq("user_id", current_user.id).execute())
+        rows = existing.data or []
+        if any(r["phone_number"] == payload.phone_number for r in rows):
+            raise HTTPException(status.HTTP_409_CONFLICT, "Contact already added")
+        if len(rows) >= MAX_CONTACTS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Maximum {MAX_CONTACTS} emergency contacts")
+        res = await db(lambda: supabase_admin.table("emergency_contacts").insert({
+            "user_id": current_user.id,
+            "contact_name": payload.name.strip(),
+            "phone_number": payload.phone_number,
+        }).execute())
+        return {"message": "Contact added successfully", "data": res.data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("add_contact failed for %s: %r", current_user.id, e)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"Contact save failed: {e}")
+
+
+@router.get("/contacts")
+async def get_contacts(current_user: User = Depends(get_current_user)):
+    try:
+        res = await db(lambda: supabase_admin.table("emergency_contacts")
+                       .select("id, name:contact_name, phone_number, created_at")
+                       .eq("user_id", current_user.id).order("created_at").execute())
+        return {"contacts": res.data or []}
+    except Exception as e:
+        log.exception("get_contacts failed for %s: %r", current_user.id, e)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"Contact fetch failed: {e}")
+
+
+@router.delete("/contacts/{contact_id}")
+async def delete_contact(contact_id: str, current_user: User = Depends(get_current_user)):
+    try:
+        res = await db(lambda: supabase_admin.table("emergency_contacts").delete()
+                       .eq("id", contact_id).eq("user_id", current_user.id).execute())
+    except Exception as e:
+        # malformed uuid etc. → treat as not found, but log it
+        log.exception("delete_contact failed for %s: %r", current_user.id, e)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
+    return {"message": "Contact deleted successfully"}
+
+
+# ---------- tracking ----------
+@router.get("/track/{share_token}")
+async def public_track(share_token: str):
+    try:
+        r = await db(lambda: supabase_admin.table("sos_incidents")
+                     .select("id, user_name, status, latitude, longitude, accuracy_m, battery_percentage, last_seen_at, created_at")
+                     .eq("share_token", share_token).maybe_single().execute())
+    except Exception as e:
+        log.exception("track lookup failed: %r", e)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Tracking unavailable")
+    if not r or not r.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    inc = r.data
+    trail = []
+    if inc["status"] == "ACTIVE":
+        try:
+            t = await db(lambda: supabase_admin.table("sos_location_updates")
+                         .select("latitude, longitude, created_at").eq("incident_id", inc["id"])
+                         .order("created_at", desc=True).limit(50).execute())
+            trail = t.data or []
+        except Exception as e:
+            log.error("trail lookup failed: %s", e)
+    inc.pop("id")
+    return {**inc, "trail": trail if inc["status"] == "ACTIVE" else []}
+
+
+# ---------- incident routes ----------
 @router.post("/{incident_id}/location")
 async def update_location(incident_id: str, payload: LocationUpdate,
                           current_user: User = Depends(get_current_user)):
@@ -423,6 +487,12 @@ async def update_location(incident_id: str, payload: LocationUpdate,
     inc = await _get_owned_incident(incident_id, current_user.id)
     if inc["status"] != "ACTIVE":
         raise HTTPException(status.HTTP_409_CONFLICT, "Incident is not active")
+    now = time.time()
+    if now - _loc_last.get(incident_id, 0.0) < 1.0:
+        return {"ok": True, "throttled": True}
+    if len(_loc_last) > 5000:
+        _loc_last.clear()
+    _loc_last[incident_id] = now
     await _record_location(incident_id, payload.latitude, payload.longitude,
                            payload.accuracy_m, payload.speed_mps, payload.battery_percentage)
     return {"ok": True}
@@ -438,100 +508,23 @@ async def cancel_sos(incident_id: str, payload: CancelRequest, background_tasks:
 
     if payload.notify_contacts and inc.get("contacts_status") in ("SENT", "SENDING"):
         async def notify_safe():
-            c = await db(lambda: supabase_admin.table("emergency_contacts").select("phone_number")
-                         .eq("user_id", current_user.id).execute())
-            nums = [x["phone_number"] for x in (c.data or [])]
-            if nums:
-                name = inc.get("user_name") or "Your contact"
-                msg = f"SURAKSHA UPDATE: {name} has marked themselves SAFE. SOS cancelled."
-                await _with_retry(incident_id, "SMS_SAFE", ",".join(nums),
-                                  lambda: _fast2sms_send(nums, msg, f"{name}|SAFE|-"))
+            if not wa_ready(WA_SAFE_CONTENT_SID):
+                log.warning("[%s] WA_SAFE_CONTENT_SID not set, contacts not told SAFE", incident_id)
+                return
+            try:
+                c = await db(lambda: supabase_admin.table("emergency_contacts").select("phone_number")
+                             .eq("user_id", current_user.id).execute())
+                nums = [x["phone_number"] for x in (c.data or [])]
+                if nums:
+                    name = inc.get("user_name") or "Your contact"
+                    await _wa_fanout(incident_id, "WA_SAFE", nums, WA_SAFE_CONTENT_SID, {"1": name})
+            except Exception as e:
+                log.error("notify_safe failed for %s: %s", incident_id, e)
         background_tasks.add_task(notify_safe)
     return {"ok": True, "status": payload.reason}
 
 
-@router.get("/track/{share_token}")
-async def public_track(share_token: str):
-    r = await db(lambda: supabase_admin.table("sos_incidents")
-                 .select("id, user_name, status, latitude, longitude, accuracy_m, battery_percentage, last_seen_at, created_at")
-                 .eq("share_token", share_token).maybe_single().execute())
-    if not r or not r.data:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
-    inc = r.data
-    trail = []
-    if inc["status"] == "ACTIVE":
-        t = await db(lambda: supabase_admin.table("sos_location_updates")
-                     .select("latitude, longitude, created_at").eq("incident_id", inc["id"])
-                     .order("created_at", desc=True).limit(50).execute())
-        trail = t.data or []
-    inc.pop("id")
-    return {**inc, "trail": trail if inc["status"] == "ACTIVE" else []}
-
-
-@router.get("/tts-message", response_class=PlainTextResponse, include_in_schema=False)
-async def exotel_tts(CustomField: str = "", key: str = Query("")):
-    if not EXOTEL_WEBHOOK_SECRET or not secrets.compare_digest(key, EXOTEL_WEBHOOK_SECRET):
-        return PlainTextResponse("Unauthorized", status_code=401)
-
-    inc = None
-    if CustomField:
-        try:
-            r = await db(lambda: supabase_admin.table("sos_incidents")
-                         .select("user_name, latitude, longitude, battery_percentage, threat_level")
-                         .eq("id", CustomField.strip()).maybe_single().execute())
-            inc = r.data if r else None
-        except Exception as e:
-            log.error("tts lookup failed: %s", e)
-
-    if not inc:
-        return ("This is an automated emergency alert from the Suraksha safety app. "
-                "A user has triggered an SOS. Location details have been sent by SMS.")
-
-    def spoken(x: float) -> str:  # "22.57264" → "22 point 5 7 2 6 4"
-        whole, frac = f"{x:.5f}".split(".")
-        return f"{whole} point {' '.join(frac)}"
-
-    msg = (f"This is an automated emergency alert from the Suraksha safety app. "
-           f"{inc['user_name']} has triggered an SOS. Threat level {inc['threat_level']}. "
-           + (f"Latitude {spoken(inc['latitude'])}. Longitude {spoken(inc['longitude'])}. "
-              if inc.get("latitude") is not None else "Location not yet available. ")
-           + f"Phone battery {inc['battery_percentage']} percent. ")
-    return msg + "Repeating. " + msg
-
-
-# ---------- contacts ----------
-@router.post("/contacts", status_code=status.HTTP_201_CREATED)
-async def add_contact(payload: ContactRequest, current_user: User = Depends(get_current_user)):
-    existing = await db(lambda: supabase_admin.table("emergency_contacts").select("id, phone_number")
-                        .eq("user_id", current_user.id).execute())
-    rows = existing.data or []
-    if any(r["phone_number"] == payload.phone_number for r in rows):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Contact already added")
-    if len(rows) >= MAX_CONTACTS:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Maximum {MAX_CONTACTS} emergency contacts")
-    res = await db(lambda: supabase_admin.table("emergency_contacts").insert({
-        "user_id": current_user.id, "name": payload.name.strip(), "phone_number": payload.phone_number,
-    }).execute())
-    return {"message": "Contact added successfully", "data": res.data}
-
-
-@router.get("/contacts")
-async def get_contacts(current_user: User = Depends(get_current_user)):
-    res = await db(lambda: supabase_admin.table("emergency_contacts").select("id, name, phone_number, created_at")
-                   .eq("user_id", current_user.id).order("created_at").execute())
-    return {"contacts": res.data or []}
-
-
-@router.delete("/contacts/{contact_id}")
-async def delete_contact(contact_id: str, current_user: User = Depends(get_current_user)):
-    res = await db(lambda: supabase_admin.table("emergency_contacts").delete()
-                   .eq("id", contact_id).eq("user_id", current_user.id).execute())
-    if not res.data:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
-    return {"message": "Contact deleted successfully"}
-
-
-# Keep this LAST — a catch-all path param would otherwise swallow /contacts, /tts-message, /track/...
+# Keep this LAST — a catch-all path param would otherwise swallow /contacts, /track/...
 @router.get("/{incident_id}")
 async def get_incident(incident_id: str, current_user: User = Depends(get_current_user)):
     return _public_incident(await _get_owned_incident(incident_id, current_user.id))
