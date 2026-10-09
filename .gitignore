@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+app.zip
+suraksha_dependencies/
+weights/
+yolov8s-worldv2.pt
+models/hand-world.pt

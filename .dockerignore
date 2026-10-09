@@ -1,0 +1,9 @@
+.git
+.env
+__pycache__
+*.pyc
+app.zip
+suraksha_dependencies
+weights
+yolov8s-worldv2.pt
+apply_*_patch.py
