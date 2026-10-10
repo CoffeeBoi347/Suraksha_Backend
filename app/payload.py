@@ -23,6 +23,14 @@ Accuracy changes vs previous version (cue logic lives in app/cues.py, unit-teste
     Client -> server: confirm_sos, cancel_sos. Server fires itself after seconds + AUTO_SOS_GRACE_S of silence.
 14. AUTO_SOS_ON_CRITICAL (default on): 0 = only prompt on Gemini-verified SOS-grade threats.
 15. Gemini cost control: CLEARED_HOLD_S, SCAN_GAP_S, GEMINI_USER_RPM.
+16. Uniformed security (police, army, CRPF/CISF/BSF/RPF, security guards): armed + on duty + NOT aimed at her = safe.
+    A uniform never excuses a strike, grab, restraint or a weapon pointed / swung at her. Cleared verdicts come back
+    with pattern "uniformed" so the phone can mute that person longer (UNIFORM_CLEAR, default on).
+17. Weapon knowledge for India: sickle, machete / chopper, axe, dagger, blade / razor, country-made pistol, rod,
+    lathi, bat, brick / stone, broken bottle and ACID (bottle / mug / cup jerked or splashed at her face).
+
+KP_MODE (new): set KP_MODE=1 and the PHONE runs pose (Unity Sentis). Server skips the pose model and decode-per-frame;
+ it tracks phone keypoints with KpTracker and keeps the object / scene / Gemini / SOS paths. Needs KeypointSender.cs.
 
 SPEED (this version):
  P1. Two-stage pipeline per connection: stage 1 (decode + pose/track on GPU, in threads) runs while stage 2
@@ -99,6 +107,18 @@ if DEVICE == "cpu":
 # ---- people / behaviour ----
 YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "480" if DEVICE == "cuda" else "320"))
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.25"))
+# KP_MODE=1: the phone runs pose (Sentis) and sends keypoints; this server loads NO pose model and only keeps the
+# object pass. Needs a client that sends {"type":"kp",...} (KeypointSender.cs) plus ~2 JPEG/s. KP_MODE=0 = old path.
+KP_MODE = os.getenv("KP_MODE", "0") == "1"
+KP_SYNC_S = float(os.getenv("KP_SYNC_S", "0.25"))          # keypoints and JPEG this close in time = crops are valid
+KP_MAX_PEOPLE = int(os.getenv("KP_MAX_PEOPLE", "12"))
+KP_TRACK_MAX_AGE_S = float(os.getenv("KP_TRACK_MAX_AGE_S", "1.5"))
+# Phone-first escalation: the phone (Sentis) rates people Easy/Moderate/Hard and only sends {"type":"verify",...}
+# (3-5 frames + a box per frame) when it wants Gemini to double-check. Run with KP_MODE=1 (no pose model on the server).
+VERIFY_MAX_FRAMES = int(os.getenv("VERIFY_MAX_FRAMES", "5"))
+VERIFY_MIN_GAP_S = float(os.getenv("VERIFY_MIN_GAP_S", "2.0"))        # per connection: one verify at a time + this gap
+VERIFY_MAX_B64 = int(os.getenv("VERIFY_MAX_B64", "400000"))           # per frame, base64 chars
+LOCAL_EVENT_PER_MIN = int(os.getenv("LOCAL_EVENT_PER_MIN", "30"))     # phone local_event inserts per connection / min
 FOLLOW_SECONDS = float(os.getenv("FOLLOW_SECONDS", "20"))
 FOLLOW_MAX_DIST_M = float(os.getenv("FOLLOW_MAX_DIST_M", "6.0"))
 FOLLOW_MIN_USER_SPEED = 0.6
@@ -150,6 +170,9 @@ GEMINI_RANK1_KEYS = {"strike", "contact", "pose", "converge_fast", "weapon_held"
 MAX_GEMINI_INFLIGHT = 2
 CROP_JPEG_Q = int(os.getenv("CROP_JPEG_Q", "75"))
 CONTEXT_JPEG_Q = int(os.getenv("CONTEXT_JPEG_Q", "65"))
+UNIFORM_CLEAR = os.getenv("UNIFORM_CLEAR", "1") == "1"            # 0 = uniforms are ignored (old behaviour)
+UNIFORM_PATTERN = "uniformed"                                      # verdict pattern when a uniform cleared the person
+ACID_HINTS = {"bottle", "cup", "mug", "jug", "glass", "can"}
 _gemini_global = asyncio.Semaphore(int(os.getenv("GEMINI_GLOBAL_INFLIGHT", "6")))
 _gemini_calls: deque = deque()
 _gemini_day: deque = deque()
@@ -229,7 +252,8 @@ SYSTEM_INSTRUCTION = (
     "INPUT: image 0 is her full view with ONE person in a red box; then 3-5 consecutive crops of that person "
     "(about 2 s, the last one is the moment that triggered this check); then a sensor note. Judge visible actions, "
     "body language, held objects and vehicles across the whole sequence; use image 0 for context (other people, "
-    "vehicles, crowd, indoors). Never judge appearance, clothing, religion, caste, age, gender or skin colour.\n\n"
+    "vehicles, crowd, indoors). Never judge appearance, clothing, religion, caste, age, gender or skin colour. "
+    "The ONLY clothing you may use is a security uniform, as described under UNIFORMED SECURITY.\n\n"
     "HOW ATTACKS ON WOMEN ARE STAGED (offender research):\n"
     "- BLITZ: sudden violence, no talk: strike, grab, push, choke, tackle, weapon drawn or swung.\n"
     "- SURPRISE: waits or lurks, then closes without speaking, often from the side or behind, out of others' sight.\n"
@@ -241,17 +265,33 @@ SYSTEM_INSTRUCTION = (
     "- STREET HARASSMENT (common in daylight crowds, buses, metro, markets): leering, walking alongside or just "
     "behind at her pace, remarks or whistles, 'accidental' brushing, groping or pressing in a crowd, pulling her "
     "dupatta or scarf, circling on a two-wheeler, turning hostile after she ignores or refuses. A group may box her in.\n"
+    "- ACID ATTACK (India-specific, usually by a rejected suitor or someone she knows): he approaches holding a "
+    "bottle, mug, cup, jug or can, often with the lid already off or the container held low and then jerked up; "
+    "the liquid is splashed or thrown at her face and head, sometimes from a two-wheeler.\n"
     "- AT HOME (most violence against women in India is by a partner or relative): striking, choking, pushing, "
     "dragging, throwing or swinging objects at her is a threat even within family; hugs, closeness or talk are not.\n\n"
+    "WEAPONS SEEN IN ATTACKS ON WOMEN IN INDIA: knife, kitchen knife, dagger, blade or razor, sickle (hansiya / "
+    "darati), machete or meat chopper, axe, country-made pistol (katta) or any gun, iron rod or pipe, lathi or "
+    "stick, hockey stick or cricket bat, brick or stone, broken bottle, acid in a bottle / mug / cup / can; and "
+    "household objects used as weapons: chair, stool, rolling pin, pressure-cooker lid, belt, chain, helmet.\n\n"
     "PRE-ATTACK INDICATORS (each a cue, not proof): repeated glances at her then away; looking around as if "
     "checking for witnesses; a hand hidden behind the back or in clothing while closing in; bladed stance, clenched "
     "fists; sudden change of pace or direction toward her; closing distance while talking; a second person moving "
-    "behind or beside her.\n\n"
+    "behind or beside her; an open container held ready while approaching her.\n\n"
+    "UNIFORMED SECURITY: police (khaki in most states, white in Kolkata), army or paramilitary (camouflage; CRPF, "
+    "CISF, BSF, RPF, ITBP), traffic police and private security guards (uniform, cap, badge, often at an ATM, bank, "
+    "mall, metro, station, gate, barricade or check-post). Real on-duty personnel usually show several of: matching "
+    "uniform with insignia or name plate, peaked cap or beret, duty belt or holster, a rifle slung or held at rest, "
+    "standing at a post or moving with other uniformed people, a marked vehicle. Set uniformed_security true only "
+    "when several of these are clearly visible; a khaki shirt alone, plain clothes or a costume is false. A weapon "
+    "slung, holstered or held at rest by uniformed security is NOT a threat. A uniform never excuses a strike, grab, "
+    "restraint, dragging her toward a vehicle, or a weapon pointed, raised or swung at her: those stay 'threat'.\n\n"
     "PATTERN labels (set `pattern`):\n"
-    "- weapon: knife or blade, OR any held object used or presented as a weapon (chair, stool, bottle, rod, pipe, "
-    "stick, brick, bat, tool, helmet or bag swung by its strap, chain, belt, umbrella). Cues: raised above shoulder "
-    "or head, cocked back, two-handed grip, swung, thrown or jabbed toward a person. Carried low, at the side, on "
-    "the head as a load, or used normally (sitting, drinking, umbrella open in rain) is NOT a weapon.\n"
+    "- weapon: any weapon from the list above held ready, OR any held object used or presented as a weapon. Cues: "
+    "raised above shoulder or head, cocked back, two-handed grip, swung, thrown, jabbed or pointed toward a person; "
+    "a container jerked, tipped or splashed toward her face (possible acid). Carried low, at the side, holstered, "
+    "slung, on the head as a load, or used normally (cooking, sitting, drinking, umbrella open in rain, farm work "
+    "with a sickle away from her) is NOT a weapon.\n"
     "- strike: punching, kicking, slapping, swinging an arm at someone.\n"
     "- grab_snatch: fast reach at her neck, chest, hands, phone, bag, chain or dupatta; tug-of-war over an item; "
     "pillion leaning out. A helmet or mask alone is not a signal.\n"
@@ -268,35 +308,39 @@ SYSTEM_INSTRUCTION = (
     "NOT threats: waving, stretching, dancing in a procession or wedding, selfies, friends hugging, a tap on the "
     "shoulder, vendors or beggars approaching with goods or an open palm, auto drivers calling out, pushing while "
     "boarding a crowded bus or train, running for a bus, sports, children playing, people looking both ways to "
-    "cross a road, someone asking directions who leaves when she walks on, a tense face alone, ordinary walking.\n\n"
+    "cross a road, someone asking directions who leaves when she walks on, a tense face alone, ordinary walking, "
+    "someone drinking from a bottle or cup, a cook or butcher using a knife at work, a farmer carrying a sickle, "
+    "uniformed police or guards standing or patrolling with weapons at rest.\n\n"
     "BASE RATE: almost everyone near her is busy with their own life. An offender's attention is FIXED on his "
     "target and his path is built around her; a bystander's attention and path are built around his own goal. "
     "Default to 'none'. You are the counter-reasoning step: argue AGAINST a threat first.\n"
     "REASON IN THIS ORDER (fill the fields in this order):\n"
     "1. benign_explanation: the most plausible ordinary explanation (on phone, talking to a companion, carrying "
-    "goods, walking to a bus, working, waiting, looking at a shop, crossing).\n"
+    "goods, walking to a bus, working, waiting, looking at a shop, crossing, on duty at a post).\n"
     "2. attention_on_wearer: true only if his face / eyes point at the camera in most frames. Head bowed, looking "
     "at a phone, at another person, at the road or sideways = false.\n"
     "3. directed_at_wearer: true only if his movement, reach or held object is aimed at HER (closing on her, "
     "reaching toward the camera, blocking her path), not at someone else or nothing.\n"
-    "4. severity, only after 1-3.\n\n"
+    "4. uniformed_security: see UNIFORMED SECURITY. If unsure, false.\n"
+    "5. severity, only after 1-4.\n\n"
     "SEVERITY:\n"
     "- 'threat': directed_at_wearer AND a hostile act visible in at least one clear frame (object raised, cocked "
-    "or swung toward her, strike, grab, restraint, charge, pulled toward a vehicle, blade shown). The benign "
-    "explanation must be clearly worse than the hostile one.\n"
+    "or swung toward her, strike, grab, restraint, charge, pulled toward a vehicle, blade or gun shown, container "
+    "jerked or splashed at her). The benign explanation must be clearly worse than the hostile one.\n"
     "- 'suspicious': attention_on_wearer across two or more frames PLUS a pre-attack cue (closing while watching her, "
-    "hand hidden while approaching, blocking her, pacing her, scanning for witnesses), and the benign explanation "
-    "is weak. Violence between OTHER people near her is also 'suspicious' (she should move away).\n"
+    "hand hidden while approaching, blocking her, pacing her, scanning for witnesses, open container held ready "
+    "while approaching), and the benign explanation is weak. Violence between OTHER people near her is also "
+    "'suspicious' (she should move away).\n"
     "- 'none': ordinary behaviour, or anything the benign explanation covers. Proximity, walking toward her on a "
-    "footpath, a loud voice, a tense face, gesturing while talking to someone else, or a dark street are 'none' on "
-    "their own.\n"
+    "footpath, a loud voice, a tense face, gesturing while talking to someone else, a dark street, or uniformed "
+    "security with weapons at rest are 'none' on their own.\n"
     "CONFIDENCE = probability your severity is right: 0.8+ only when the action is clear in two or more frames; "
     "0.6 or less when frames are blurry, occluded or the key moment is ambiguous.\n\n"
     "OUTPUT: reason under 10 words describing what is SEEN, not intent. unity_instruction under 8 words, empty unless "
-    "'threat': weapon -> 'Weapon raised. Back away. Shout.'; grab_snatch -> 'Secure phone and bag. Step away.'; "
-    "strike/charge/restrain -> 'Attack. Shout. Run to people.'; block -> 'Path blocked. Turn back. Call out.'; "
-    "con -> 'Do not stop. Walk to people.'; ambush -> 'Move toward people now.'; vehicle -> 'Step back from "
-    "vehicle. Move away.'; harass -> 'Keep moving. Go to people.'."
+    "'threat': weapon -> 'Weapon raised. Back away. Shout.'; acid or liquid -> 'Cover face. Turn away. Run.'; "
+    "grab_snatch -> 'Secure phone and bag. Step away.'; strike/charge/restrain -> 'Attack. Shout. Run to people.'; "
+    "block -> 'Path blocked. Turn back. Call out.'; con -> 'Do not stop. Walk to people.'; ambush -> 'Move toward "
+    "people now.'; vehicle -> 'Step back from vehicle. Move away.'; harass -> 'Keep moving. Go to people.'."
 )
 
 _gemini = genai.Client()
@@ -304,7 +348,8 @@ _gpu_lock = asyncio.Semaphore(1 if DEVICE == "cuda" else 2)
 _active_connections = 0
 _features_col = True
 
-YOLO(POSE_WEIGHTS)  # fetch the weights on import
+if not KP_MODE:
+    YOLO(POSE_WEIGHTS)  # fetch the weights on import
 _obj_model = YOLO(OBJ_WEIGHTS) if OBJ_DETECT else None
 if _obj_model is not None:
     log.info("Weapon model: %s (classes: %s)", OBJ_WEIGHTS, getattr(_obj_model, "names", "?"))
@@ -375,6 +420,7 @@ class GeminiVerdict(BaseModel):
     benign_explanation: str
     attention_on_wearer: bool
     directed_at_wearer: bool
+    uniformed_security: bool = False
     severity: Severity
     confidence: float = Field(..., ge=0.0, le=1.0)
     pattern: Pattern = Pattern.none
@@ -384,7 +430,7 @@ class GeminiVerdict(BaseModel):
 
 def _build_gemini_config() -> types.GenerateContentConfig:
     cfg = dict(system_instruction=SYSTEM_INSTRUCTION, response_mime_type="application/json",
-               response_schema=GeminiVerdict, temperature=0.1, max_output_tokens=200)
+               response_schema=GeminiVerdict, temperature=0.1, max_output_tokens=220)
     mr = os.getenv("GEMINI_MEDIA_RES", "").strip().lower()       # low = ~4x fewer image tokens per call
     if mr in ("low", "medium", "high"):
         cfg["media_resolution"] = getattr(types.MediaResolution, f"MEDIA_RESOLUTION_{mr.upper()}")
@@ -602,15 +648,19 @@ def _encode_contents(crops: list, dist_m: float, hint: str, ctx: str, scene: np.
     if hint:
         contents.append(f"An object detector (often wrong: phones and pens read as knives) flagged a possible "
                         f"{hint} near this person's hand. First check it is really there. Judge HOW it is held: "
-                        "raised above the shoulder, cocked back, swung, thrown or jabbed toward someone = 'threat'; "
-                        "carried low, at the side, as a load or used normally = not a threat.")
+                        "raised above the shoulder, cocked back, swung, thrown, pointed or jabbed toward someone = "
+                        "'threat'; carried low, at the side, holstered, slung, as a load or used normally = not a threat.")
+        if hint.lower().strip() in ACID_HINTS:
+            contents.append("It is a container: check for a lid off, the container held ready while he approaches, "
+                            "or a jerk / splash toward her face (possible acid). Someone simply drinking is 'none'.")
     return contents
 
 
 async def verify_with_gemini(crops: list, dist_m: float, hint: str = "", ctx: str = "",
                              scene: np.ndarray | None = None) -> tuple[str, float, str, str, str] | None:
     """-> (severity, confidence, reason, instruction, pattern), or None if the check itself failed.
-    None = 'no information', never 'safe': callers must not downgrade on it."""
+    None = 'no information', never 'safe': callers must not downgrade on it.
+    pattern == UNIFORM_PATTERN means uniformed security, weapon at rest, not aimed at her: cleared to 'none'."""
     global _gemini_block_until
     if len(crops) < TEMPORAL_MIN_FRAMES:
         return None
@@ -626,16 +676,25 @@ async def verify_with_gemini(crops: list, dist_m: float, hint: str = "", ctx: st
         if verdict is None:
             verdict = GeminiVerdict.model_validate_json(resp.text)
         sev = verdict.severity.value
+        pattern = verdict.pattern.value
         if sev == "threat" and not verdict.directed_at_wearer:
             sev = "suspicious"
         if (sev == "suspicious" and not verdict.attention_on_wearer and not verdict.directed_at_wearer
                 and verdict.pattern not in (Pattern.weapon, Pattern.strike, Pattern.restrain)):
             sev = "none"
-        log.info("gemini sev=%s (raw %s) pat=%s conf=%.2f attn=%s dir=%s | %s | benign: %s", sev,
-                 verdict.severity.value, verdict.pattern.value, verdict.confidence, verdict.attention_on_wearer,
-                 verdict.directed_at_wearer, verdict.reason, verdict.benign_explanation[:80])
-        return (sev, float(verdict.confidence), verdict.reason[:80],
-                verdict.unity_instruction[:60] if sev == "threat" else "", verdict.pattern.value)
+        # On-duty police / army / guard with a weapon at rest, not aimed at her: safe. Never clears a directed act.
+        if (UNIFORM_CLEAR and verdict.uniformed_security and not verdict.directed_at_wearer
+                and verdict.pattern in (Pattern.weapon, Pattern.concealed, Pattern.none)):
+            sev, pattern = "none", UNIFORM_PATTERN
+        log.info("gemini sev=%s (raw %s) pat=%s conf=%.2f attn=%s dir=%s uni=%s | %s | benign: %s", sev,
+                 verdict.severity.value, pattern, verdict.confidence, verdict.attention_on_wearer,
+                 verdict.directed_at_wearer, verdict.uniformed_security, verdict.reason,
+                 verdict.benign_explanation[:80])
+        reason = verdict.reason[:80]
+        if pattern == UNIFORM_PATTERN and "uniform" not in reason.lower():
+            reason = ("Uniformed security, weapon at rest. " + reason)[:80]
+        return (sev, float(verdict.confidence), reason,
+                verdict.unity_instruction[:60] if sev == "threat" else "", pattern)
     except asyncio.TimeoutError:
         log.info("gemini verify timeout")
         return None
@@ -704,8 +763,22 @@ async def log_threat_event(user_id: str, track_id: str, level: str, source: str,
         data = getattr(res, "data", None)
         if sink is not None and data:
             sink.append((time.time(), data[0]["id"], track_id))
+        log.info("threat_events insert OK %s %s %s (%s)", source, level, track_id, "row" if data else "no data returned")
     except Exception as e:
-        log.error("threat_events insert failed: %s", e)
+        log.error("threat_events insert failed (%s %s %s): %s", source, level, track_id, e)
+
+
+async def insert_feedback_event(user_id: str, label: str, reason: str, gps: dict) -> None:
+    """Feedback with nothing to label (no recent rows): store the answer as its own row. Never raises."""
+    row = {"user_id": user_id, "track_id": "feedback", "level": "CRITICAL", "source": "PHONE_FEEDBACK",
+           "score": 0.0, "reason": (reason or "Feedback after SOS popup")[:200], "verified_by_gemini": False,
+           "latitude": gps.get("latitude"), "longitude": gps.get("longitude"),
+           "user_label": label, "labeled_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        await db(lambda: supabase_admin.table("threat_events").insert(row).execute())
+        log.info("threat_events feedback row OK (%s)", label)
+    except Exception as e:
+        log.error("threat_events feedback insert failed: %s", e)
 
 
 async def label_threat_events(user_id: str, ids: list, label: str) -> None:
@@ -717,6 +790,95 @@ async def label_threat_events(user_id: str, ids: list, label: str) -> None:
         log.error("threat_events label failed: %s", e)
 
 
+def _kp_iou(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / u if u > 0 else 0.0
+
+
+class KpTracker:
+    """Greedy IoU tracker for phone keypoints (replaces ByteTrack in KP_MODE). Stable int ids; a lost track is kept
+    for KP_TRACK_MAX_AGE_S so a person who is briefly missed keeps the same id. Second pass matches fast movers by
+    centre distance when their boxes no longer overlap between packets."""
+
+    def __init__(self, iou_min: float = 0.25, max_age: float = 1.5):
+        self.iou_min, self.max_age = iou_min, max_age
+        self.tracks: dict[int, tuple[list, float]] = {}      # id -> (box, last_t)
+        self.next_id = 1
+
+    def update(self, boxes: list, t: float) -> list[int]:
+        for tid in [k for k, (_, lt) in self.tracks.items() if t - lt > self.max_age]:
+            del self.tracks[tid]
+        ids = [-1] * len(boxes)
+        used_t: set[int] = set()
+        pairs = sorted(((_kp_iou(b, tb), i, tid) for i, b in enumerate(boxes) for tid, (tb, _) in self.tracks.items()),
+                       reverse=True)
+        for sc, i, tid in pairs:
+            if sc < self.iou_min:
+                break
+            if ids[i] >= 0 or tid in used_t:
+                continue
+            ids[i] = tid
+            used_t.add(tid)
+        for i, b in enumerate(boxes):                         # fallback: nearest unused track centre
+            if ids[i] >= 0:
+                continue
+            cx, cy, bh = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2, max(b[3] - b[1], 1.0)
+            best, bd = None, 0.75 * bh
+            for tid, (tb, _) in self.tracks.items():
+                if tid in used_t:
+                    continue
+                d = ((cx - (tb[0] + tb[2]) / 2) ** 2 + (cy - (tb[1] + tb[3]) / 2) ** 2) ** 0.5
+                if d < bd:
+                    best, bd = tid, d
+            if best is not None:
+                ids[i] = best
+                used_t.add(best)
+        for i, b in enumerate(boxes):
+            if ids[i] < 0:
+                ids[i] = self.next_id
+                self.next_id += 1
+            self.tracks[ids[i]] = (list(b), t)
+        return ids
+
+
+def kp_to_raw(tracker: KpTracker, m: dict, w_img: int, h_img: int, t: float):
+    """Phone message -> the same (xyxy, ids, kxy, kcf) tuple infer() returns. Coordinates are rescaled from the
+    phone's image size (m.w x m.h) to the JPEG we hold. None when nobody is in view / the message is malformed."""
+    people = m.get("people")
+    try:
+        w0, h0 = float(m.get("w") or 0), float(m.get("h") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(people, list) or not people or w0 <= 0 or h0 <= 0:
+        return None
+    sx, sy = w_img / w0, h_img / h0
+    scale = np.array([sx, sy], np.float32)
+    boxes, kxy, kcf = [], [], []
+    for p in people[:KP_MAX_PEOPLE]:
+        try:
+            b, k = p["box"], p["kp"]
+            if len(b) != 4:
+                continue
+            arr = np.asarray(k, dtype=np.float32)
+            if arr.shape != (17, 3) or not np.isfinite(arr).all():
+                continue
+            box = [float(b[0]) * sx, float(b[1]) * sy, float(b[2]) * sx, float(b[3]) * sy]
+            if not all(np.isfinite(box)):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        boxes.append(box)
+        kxy.append(arr[:, :2] * scale)
+        kcf.append(arr[:, 2])
+    if not boxes:
+        return None
+    ids = tracker.update(boxes, t)
+    return (np.asarray(boxes, np.float32), np.asarray(ids, int), np.stack(kxy), np.stack(kcf))
+
+
 def _load_pose_model() -> YOLO:
     """Per-connection model (ByteTrack state is per model). Loaded + warmed in a thread."""
     m = YOLO(POSE_WEIGHTS)
@@ -724,6 +886,56 @@ def _load_pose_model() -> YOLO:
         m.track(source=np.zeros((360, 640, 3), np.uint8), persist=True, tracker="bytetrack.yaml", classes=[0],
                 imgsz=YOLO_IMGSZ, device=DEVICE, half=HALF, verbose=False, conf=YOLO_CONF)
     return m
+
+
+# phone cue ids (LocalThreat.CuesJson) -> plain English for the Gemini sensor note
+_CUE_TXT = {"raised_arm": "arm raised", "fast_arm": "fast arm movement", "two_hand_grip": "two hands raised together",
+            "pointing": "arm held out toward the wearer", "lunge": "sudden closing in", "bladed_stance": "body turned "
+            "side-on while facing the wearer", "charge": "fast movement", "close_facing": "very close and facing the "
+            "wearer", "crowd": "several people close", "closing_in": "walking straight toward the wearer",
+            "hidden_hands": "hands not visible while closing in", "guard_stance": "both fists raised near the face",
+            "two_people_closing": "two people converging on the wearer",
+            "two_people_flanking": "two people closing in from both sides",
+            "staring": "staring at the wearer for several seconds",
+            "following": "has stayed near the wearer while they walked",
+            # negative evidence (reasons it may be harmless)
+            "rhythmic_motion": "regular rhythmic arm movement (dance / exercise / clapping)",
+            "passing_by": "walking past, path does not reach the wearer",
+            "child_proportions": "body proportions of a child",
+            "holding_everyday_object": "holding an everyday object (phone / bag / bottle)",
+            "friendly_gesture": "waving or hand at face / ear",
+            "wearer_in_vehicle": "wearer is riding a vehicle",
+            "camera_shaking": "camera shaking (motion cues unreliable)",
+            # environment context
+            "dark_scene": "dark surroundings", "night_time": "night time",
+            "few_people_around": "few other people around"}
+
+
+def _cue_text(c: str) -> str | None:
+    if c in _CUE_TXT:
+        return _CUE_TXT[c]
+    for pre, txt, tail in (("weapon_held_active_", "raising / using a possible ", ""),
+                           ("weapon_held_at_rest_", "holding a possible ", " at rest (not raised)"),
+                           ("weapon_held_", "holding a possible ", ""),
+                           ("weapon_near_", "possible ", " nearby")):
+        if c.startswith(pre):
+            lbl = "".join(ch for ch in c[len(pre):].replace("_", " ")[:20] if ch.isalnum() or ch == " ").strip()
+            if lbl:
+                return txt + lbl + tail
+    return None
+
+
+@router.get("/app-config")
+async def app_config():
+    """Global closed-testing switch for the app's Boot scene. No auth: it only says open / closed.
+    Flip it in Supabase: update app_config set testing_open = false;"""
+    try:
+        res = await db(lambda: supabase_admin.table("app_config").select("testing_open").eq("id", 1).limit(1).execute())
+        rows = getattr(res, "data", None) or []
+        return {"testing_open": bool(rows[0]["testing_open"]) if rows else True}
+    except Exception as e:
+        log.error("app_config read failed: %s", e)
+        return {"testing_open": True}          # config table broken: don't lock testers out
 
 
 @router.websocket("/prod/main")
@@ -754,8 +966,11 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
 
     # ---- per-connection state (nothing shared between users) ----
     try:
-        async with _gpu_lock:
-            model = await asyncio.to_thread(_load_pose_model)   # was blocking EVERY connection's event loop
+        if KP_MODE:
+            model = None                                         # phone sends keypoints: no pose model here
+        else:
+            async with _gpu_lock:
+                model = await asyncio.to_thread(_load_pose_model)   # was blocking EVERY connection's event loop
     except Exception as e:
         log.exception("pose model load failed: %s", e)
         _active_connections -= 1
@@ -765,6 +980,7 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
     cooldown: dict[str, float] = {}
     cleared: dict[str, tuple[float, frozenset]] = {}
     my_calls: deque = deque()
+    local_ev_times: deque = deque()                          # phone local_event rate limit (per connection)
     last_scan = 0.0
     pending: dict[str, tuple[asyncio.Task, str]] = {}
     verdicts: dict[str, tuple] = {}
@@ -776,6 +992,11 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
     crowd = CrowdBaseline()
     clock = FrameClock()
     latest: tuple[bytes, float, float | None] | None = None
+    latest_kp: tuple[dict, float] | None = None              # KP_MODE: newest keypoint packet (msg, recv_ts)
+    kp_frame: tuple[np.ndarray, float] | None = None         # KP_MODE: newest decoded JPEG (frame, its server-time)
+    kp_tracker = KpTracker(max_age=KP_TRACK_MAX_AGE_S)
+    kp_synced = True                                         # False when the held JPEG is too old to crop from
+    kp_new_frame = False                                     # True once per newly decoded JPEG (object pass dedupe)
     new_frame = asyncio.Event()
     closed = False
     send_lock = asyncio.Lock()
@@ -969,8 +1190,125 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
             countdown_task = None
         spawn(fire_and_report("Manual SOS", last_frame, "MANUAL"))
 
+    verify_busy = False
+    verify_last = 0.0
+    last_follow_ts = 0.0
+
+    async def handle_verify(msg: dict) -> None:
+        """Phone-first: Sentis on the phone flagged someone Moderate/Hard and sent 3-5 full frames + that person's box
+        in each (normalised 0-1). Same Gemini check as before; the answer is ONE `verdict` message with the box to draw.
+        verdict.pattern == "uniformed" -> uniformed security cleared; the phone should mute that person longer."""
+        nonlocal verify_busy, verify_last, last_frame, last_critical_ts, last_critical_reason
+        vid = msg.get("id", 0)
+        out = {"type": "verdict", "id": vid, "severity": "unknown", "level": "UNKNOWN", "confidence": 0.0,
+               "reason": "", "instruction": "", "pattern": "", "uniformed": False, "box": None}
+        now = time.time()
+        log.info("verify recv p%s level=%s frames=%s", vid, msg.get("level"),
+                 len(msg.get("frames") or []) if isinstance(msg.get("frames"), list) else 0)
+        if verify_busy or now - verify_last < VERIFY_MIN_GAP_S:
+            out["reason"] = "busy"
+            log.info("verify p%s -> UNKNOWN (busy)", vid)
+            await try_send(out)
+            return
+        verify_busy = True
+        verify_last = now
+        try:
+            frames = msg.get("frames")
+            if not isinstance(frames, list):
+                frames = []
+            frames = frames[-VERIFY_MAX_FRAMES:]
+            lvl_in = "HARD" if msg.get("level") == "HARD" else "MODERATE"
+            try:
+                dist = min(30.0, max(0.3, float(msg.get("dist", 2.0))))
+            except (TypeError, ValueError):
+                dist = 2.0
+            hint = "".join(ch for ch in str(msg.get("hint", ""))[:20] if ch.isalnum() or ch == " ")
+            raw_cues = msg.get("cues") if isinstance(msg.get("cues"), list) else []
+            cues = [t for t in (_cue_text(c) for c in raw_cues[:24] if isinstance(c, str)) if t]
+            ctx = f"the on-device check rated this person {lvl_in}" + (f"; cues: {', '.join(cues)}" if cues else "")
+
+            def build():
+                crops, img, bx, wh = [], None, None, None
+                for i, f in enumerate(frames):
+                    if not isinstance(f, dict) or not isinstance(f.get("jpg"), str) or len(f["jpg"]) > VERIFY_MAX_B64:
+                        continue
+                    try:
+                        im = cv2.imdecode(np.frombuffer(base64.b64decode(f["jpg"]), np.uint8), cv2.IMREAD_COLOR)
+                        b = [min(1.0, max(0.0, float(v))) for v in f["box"]]
+                    except Exception:
+                        continue
+                    if im is None or len(b) != 4:
+                        continue
+                    h, w = im.shape[:2]
+                    px = (b[0] * w, b[1] * h, b[2] * w, b[3] * h)
+                    if px[2] - px[0] < 8 or px[3] - px[1] < 8:
+                        continue
+                    c = _person_crop(im, px, wide=(i == len(frames) - 1))
+                    if c is None:
+                        continue
+                    crops.append(c)
+                    img, bx, wh = im, px, (w, h)
+                return crops, img, bx, wh
+
+            crops, img, bx, wh = await asyncio.to_thread(build)
+            if len(crops) < TEMPORAL_MIN_FRAMES or img is None:
+                out["reason"] = "need_frames"
+                log.info("verify p%s -> UNKNOWN (need_frames: %d usable crops)", vid, len(crops))
+                await try_send(out)
+                return
+            now = time.time()
+            if not (_gemini_ok(now) and _budget_ok(user.id, now)):
+                out["reason"] = "budget"
+                log.info("verify p%s -> UNKNOWN (budget / rate cap)", vid)
+                await try_send(out)
+                return
+            _gemini_calls.append(now)
+            _budget_spend(user.id, now)
+            last_frame = img
+            v = await gemini_check(crops, dist, hint, ctx, img, bx)
+            if v is None:
+                out["reason"] = "check_failed"
+                log.warning("verify p%s -> UNKNOWN (check_failed: Gemini timeout/quota/error, see lines above)", vid)
+                await try_send(out)
+                return
+            sev, conf, reason, instr, pattern = v
+            if sev == "threat" and conf >= GEMINI_MIN_CONF:
+                level = "CRITICAL"
+            elif sev in ("threat", "suspicious"):
+                level = "MODERATE"
+            else:
+                level = "NORMAL"
+            w, h = wh
+            now2 = time.time()
+            crit_range = level == "CRITICAL" and dist <= AUTO_SOS_MAX_DIST_M
+            sos_ok = bool(crit_range and can_prompt(now2) and
+                          (AUTO_SOS_ON_CRITICAL or (conf >= AUTO_SOS_MIN_CONF and pattern in SOS_PATTERNS)))
+            out.update({"sos": sos_ok, "severity": sev, "level": level, "confidence": round(float(conf), 2), "reason": reason,
+                        "instruction": instr, "pattern": pattern, "uniformed": pattern == UNIFORM_PATTERN,
+                        "box": {"x_min": bx[0] / w, "y_min": bx[1] / h,
+                                "width": (bx[2] - bx[0]) / w, "height": (bx[3] - bx[1]) / h}})
+            await try_send(out)
+            log.info("verify p%s -> %s (sev=%s conf=%.2f pat=%s sos=%s) %s", vid, level, sev, conf, pattern, sos_ok, reason)
+            if level == "NORMAL" and pattern == UNIFORM_PATTERN:
+                log.info("verify p%s cleared: uniformed security (%s)", vid, reason)
+            fe = msg.get("feat")
+            feat = {str(k)[:16]: round(float(v), 3) for k, v in list(fe.items())[:16]
+                    if isinstance(v, (int, float))} if isinstance(fe, dict) else {}
+            feat.update({"gemini_sev": sev, "gemini_conf": round(float(conf), 2), "pattern": pattern,
+                         "phone_level": lvl_in})
+            spawn(log_threat_event(user.id, f"p{vid}", level, "PHONE_VERIFY", float(conf), reason, dist, None,
+                                   True, gps, recent_events, features=feat))
+            # NOTE: no last_critical_ts here on purpose. That arms the dead-man switch, which fires an SOS with NO popup
+            # when the app closes right after a verdict. In phone-first mode only the popup (Send / countdown) fires it.
+        except Exception as e:
+            log.warning("verify failed (%s): %s", user.id, e)
+            out["reason"] = "error"
+            await try_send(out)
+        finally:
+            verify_busy = False
+
     async def handle_control(msg: dict):
-        nonlocal countdown_task, fired_incident, company, audio_busy
+        nonlocal countdown_task, fired_incident, company, audio_busy, last_follow_ts
         nonlocal armed_frame, armed_reason, armed_details, armed_track
         kind = msg.get("type")
         if kind == "gps":
@@ -1044,8 +1382,12 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
             cutoff = time.time() - FEEDBACK_WINDOW_S
             tid = msg.get("track_id") if isinstance(msg.get("track_id"), str) else None
             ids = [eid for ts, eid, trk in recent_events if ts >= cutoff and (tid is None or trk == tid)]
+            log.info("feedback %s from %s: labelling %d recent event(s)", label, user.id, len(ids))
             if ids:
                 spawn(label_threat_events(user.id, ids, label))
+            else:
+                why_f = "".join(ch for ch in str(msg.get("reason", ""))[:120] if ch.isprintable())
+                spawn(insert_feedback_event(user.id, label, why_f, gps))
             await send_json({"type": "feedback_ack", "label": label, "events_labeled": len(ids)})
         elif kind == "test_popup" and os.getenv("SOS_TEST_POPUP", "0") == "1":
             if countdown_task is None and not fire_busy():
@@ -1055,6 +1397,58 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                 armed_details = {"source": "test", "pattern": "weapon", "confidence": 0.95,
                                  "instruction": "Test only.", "thumb_b64": None, **gps_details()}
                 countdown_task = asyncio.create_task(countdown())
+        elif kind == "auto_sos":
+            # the PHONE opened the popup (verified CRITICAL verdict); Send or countdown timeout lands here
+            nowa = time.time()
+            if fire_busy() or recently_fired(nowa):
+                await send_json({"type": "sos_already_sent", "incident": fired_incident})
+            else:
+                why = "".join(ch for ch in str(msg.get("reason", ""))[:80] if ch.isprintable())
+                log.warning("AUTO SOS (phone popup) user=%s reason=%s", user.id, why)
+                spawn(fire_and_report("Phone-detected threat: " + why, last_frame, "AUTO_HUD"))
+        elif kind == "follow":
+            if time.time() - last_follow_ts >= 60.0:           # soft warning, logged only: never fires an SOS on its own
+                last_follow_ts = time.time()
+                try:
+                    near_s, path_m = float(msg.get("near_s", 0)), float(msg.get("path_m", 0))
+                    dist_f = float(msg.get("dist", 0)) or None
+                except (TypeError, ValueError):
+                    near_s = path_m = 0.0
+                    dist_f = None
+                spawn(log_threat_event(user.id, f"p{msg.get('id', 0)}", "MODERATE", "PHONE_FOLLOW", 0.5,
+                                       f"Same person near for {near_s:.0f}s while you moved {path_m:.0f}m",
+                                       dist_f, None, False, gps, recent_events))
+        elif kind == "local_event":
+            # Phone's own rating (LocalThreat), logged with NO Gemini dependency. Never fires an SOS by itself.
+            nowl = time.time()
+            while local_ev_times and nowl - local_ev_times[0] > 60.0:
+                local_ev_times.popleft()
+            log.info("local_event recv p%s %s %s score=%s", msg.get("id"), msg.get("level"), msg.get("source"), msg.get("score"))
+            if len(local_ev_times) >= LOCAL_EVENT_PER_MIN:
+                log.info("local_event dropped: rate limit")
+                return
+            local_ev_times.append(nowl)
+            lvl = msg.get("level") if msg.get("level") in ("MODERATE", "CRITICAL") else None
+            src = msg.get("source") if msg.get("source") in ("PHONE_LOCAL", "PHONE_POPUP") else "PHONE_LOCAL"
+            if lvl is None:
+                return
+            try:
+                score_l = min(1.0, max(0.0, float(msg.get("score", 0.0))))
+                dist_l = min(30.0, max(0.3, float(msg.get("dist", 2.0))))
+                appr_l = float(msg.get("appr", 0.0))
+            except (TypeError, ValueError):
+                return
+            why_l = "".join(ch for ch in str(msg.get("reason", ""))[:120] if ch.isprintable())
+            fe = msg.get("feat")
+            feat_l = {str(k)[:16]: round(float(v), 3) for k, v in list(fe.items())[:48]
+                      if isinstance(v, (int, float))} if isinstance(fe, dict) else {}
+            cues_l = msg.get("cues")
+            if isinstance(cues_l, list):
+                feat_l["cues"] = [str(c)[:40] for c in cues_l[:20]]
+            spawn(log_threat_event(user.id, f"p{msg.get('id', 0)}", lvl, src, score_l, why_l, dist_l, appr_l,
+                                   False, gps, recent_events, features=feat_l))
+        elif kind == "verify":
+            spawn(handle_verify(msg))                  # ~2 s Gemini call: never block the receiver
         elif kind == "manual_sos":
             await trigger_manual()
 
@@ -1082,7 +1476,7 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
     ctl_times: deque = deque()
 
     async def receiver():
-        nonlocal latest, closed
+        nonlocal latest, latest_kp, closed
         try:
             while True:
                 msg = await websocket.receive()
@@ -1096,7 +1490,8 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                             cap = int.from_bytes(data[4:12], "little") / 1000.0
                             data = data[12:]
                         latest = (data, time.time(), cap)
-                        new_frame.set()
+                        if not KP_MODE:
+                            new_frame.set()                 # KP_MODE wakes on keypoints; JPEGs are decoded lazily
                 elif msg.get("text"):
                     try:
                         m = json.loads(msg["text"])
@@ -1104,7 +1499,12 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                         continue
                     if not isinstance(m, dict):
                         continue
-                    if m.get("type") not in ("manual_sos", "confirm_sos", "cancel_sos"):   # never throttle SOS
+                    if m.get("type") == "kp":                 # 10 Hz keypoints: not a control message, never throttled
+                        if KP_MODE:
+                            latest_kp = (m, time.time())
+                            new_frame.set()
+                        continue
+                    if m.get("type") not in ("manual_sos", "confirm_sos", "cancel_sos", "auto_sos"):   # never throttle SOS
                         tnow = time.monotonic()
                         while ctl_times and tnow - ctl_times[0] > 1.0:
                             ctl_times.popleft()
@@ -1145,6 +1545,42 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
         finally:
             infer_ready.set()
 
+    async def infer_loop_kp():
+        """KP_MODE stage 1: phone keypoints -> tracker -> the same `raw` tuple the pose model used to produce."""
+        nonlocal latest, latest_kp, infer_slot, kp_frame, kp_synced, kp_new_frame
+        try:
+            while not closed:
+                await new_frame.wait()
+                new_frame.clear()
+                if closed:
+                    break
+                if latest is not None:                        # a fresh picture arrived: decode it off the event loop
+                    jpeg, jrecv, jcap = latest
+                    latest = None
+                    f = await asyncio.to_thread(decode_frame, jpeg)
+                    if f is not None:
+                        off = clock.offset
+                        jft = (jcap + off) if (jcap is not None and off is not None) else jrecv
+                        kp_frame = (f, jft)
+                        kp_new_frame = True
+                if latest_kp is None:
+                    continue
+                m, recv_ts = latest_kp
+                latest_kp = None
+                if kp_frame is None:
+                    continue                                  # need one picture for scene / objects / crops
+                frame, jft = kp_frame
+                cts = m.get("t")
+                ft = clock.stamp(recv_ts, float(cts) / 1000.0 if isinstance(cts, (int, float)) else None)
+                kp_synced = abs(ft - jft) <= KP_SYNC_S
+                raw = kp_to_raw(kp_tracker, m, frame.shape[1], frame.shape[0], ft)
+                infer_slot = (frame, raw, ft, recv_ts)
+                infer_ready.set()
+        except Exception as e:
+            log.exception("kp loop failed (%s): %s", user.id, e)
+        finally:
+            infer_ready.set()
+
     async def obj_loop():
         """Objects / vehicles on the newest frame, time-gated, never blocking the HUD frame loop."""
         nonlocal obj_req, obj_cache
@@ -1171,7 +1607,7 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                 log.warning("object pass failed: %s", e)
 
     recv_task = asyncio.create_task(receiver())
-    infer_task = asyncio.create_task(infer_loop())
+    infer_task = asyncio.create_task(infer_loop_kp() if KP_MODE else infer_loop())
     obj_task = asyncio.create_task(obj_loop()) if _obj_model is not None else None
 
     try:
@@ -1222,11 +1658,12 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                                  "pos": locate((x1 + bw / 2) / w_img, dist, hfov)})
 
             # ---- B. hand the newest frame to the object task; batch re-ID in one thread hop ----
-            if obj_task is not None and dets:
+            if obj_task is not None and dets and (not KP_MODE or kp_new_frame):
                 obj_req = (frame, ft, [d["box"] for d in sorted(dets, key=lambda d: d["dist"])
-                                       if d["dist"] <= OBJ_CROP_MAX_DIST_M])
+                                       if kp_synced and d["dist"] <= OBJ_CROP_MAX_DIST_M])
                 obj_wake.set()
-            need = [d for d in dets if d["reid_ok"] and ft - d["st"]["last_reid"] >= REID_EVERY_S]
+                kp_new_frame = False                          # KP_MODE: run the object pass once per picture
+            need = [d for d in dets if kp_synced and d["reid_ok"] and ft - d["st"]["last_reid"] >= REID_EVERY_S]
             if need:
                 embs = await asyncio.to_thread(_embed_many, frame, [d["box"] for d in need])
                 for d, e in zip(need, embs):
@@ -1399,12 +1836,14 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                         verdicts[key] = (ft, *res_v, pt[1])
                         fresh = res_v[0] == "threat" and res_v[1] >= _min_conf(pt[1])
                         if res_v[0] == "none" and res_v[1] >= GEMINI_CLEAR_CONF:
-                            cleared[key] = (ft + CLEARED_HOLD_S, cue_sig)
+                            # uniformed security stays cleared longer: a guard at his post is there all day
+                            hold = CLEARED_HOLD_S * (4.0 if res_v[4] == UNIFORM_PATTERN else 1.0)
+                            cleared[key] = (ft + hold, cue_sig)
                         else:
                             cleared.pop(key, None)
 
                 # 3. rolling crop buffer for nearby tracks
-                if dist <= CROP_MAX_DIST_M and ft - st["last_crop"] >= CROP_INTERVAL_S:
+                if kp_synced and dist <= CROP_MAX_DIST_M and ft - st["last_crop"] >= CROP_INTERVAL_S:
                     crop = _person_crop(frame, d["box"], wide=held)
                     if crop is not None:
                         crop_history.setdefault(key, deque(maxlen=TEMPORAL_FRAME_COUNT)).append((ft, crop))
@@ -1459,6 +1898,8 @@ async def main_suraksha(websocket: WebSocket, token: str = Query(None),
                 if (GEMINI_CAN_CLEAR and v and v[1] == "none" and v[2] >= GEMINI_CLEAR_CONF and rank == 1
                         and not hard_act):
                     rank, score, reason, cleared_now = 0, min(score, 0.2), "", True
+                if v and v[5] == UNIFORM_PATTERN and v[2] >= GEMINI_CLEAR_CONF:
+                    pattern = UNIFORM_PATTERN                   # shown on the HUD box: "uniformed"
                 rank, score, reason = _stabilise(st, rank, score, reason, ft, clear=cleared_now)
                 level = RANK_LEVEL[rank]
                 cmd = v[4] if verified else ""
